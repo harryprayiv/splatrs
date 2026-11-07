@@ -1,0 +1,902 @@
+-- allium: 3
+-- splatrs: 3D Gaussian splatting from COLMAP reconstructions.
+--
+-- Observable behaviour of the splatrs command-line tool: inspecting a reconstruction,
+-- training a splat and rendering views from it. The differentiable kernels (projection,
+-- tiled compositing, loss) are specified as contracts with the properties the test suite
+-- checks; their arithmetic lives in DESIGN.md and the source, not here.
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- The person or script invoking the command-line tool.
+external entity Shell {}
+
+-- A COLMAP sparse model directory (sparse/0 or sparse), binary or text.
+external entity Reconstruction {
+    directory: String
+    cameras: ReconstructionCamera with reconstruction = this
+    images: RegisteredImage with reconstruction = this
+    points: SparsePoint with reconstruction = this
+
+    is_trainable: cameras.all(c => c.is_pinhole)
+}
+
+-- One COLMAP camera (intrinsics shared by any number of images).
+external entity ReconstructionCamera {
+    reconstruction: Reconstruction
+    model: CameraModel
+    width: Integer
+    height: Integer
+    is_pinhole: model in {simple_pinhole, pinhole}
+}
+
+-- One registered COLMAP image (extrinsics), and the file it names.
+external entity RegisteredImage {
+    reconstruction: Reconstruction
+    name: String
+    camera: ReconstructionCamera
+    pose: Pose
+    file: ImageFile?
+}
+
+-- A decoded image file on disk.
+external entity ImageFile {
+    path: String
+    width: Integer
+    height: Integer
+}
+
+-- A triangulated sparse point with its colour.
+external entity SparsePoint {
+    reconstruction: Reconstruction
+    position: Vec3
+    colour: Rgb8
+}
+
+-- A program that reads the standard 3DGS PLY layout (Blender 5.3, SuperSplat, add-ons).
+external entity SplatViewer {}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value Vec3 {
+    x: Decimal
+    y: Decimal
+    z: Decimal
+}
+
+value Quaternion {
+    w: Decimal
+    x: Decimal
+    y: Decimal
+    z: Decimal
+}
+
+value Rgb8 {
+    r: Integer
+    g: Integer
+    b: Integer
+}
+
+-- World-to-camera transform in COLMAP convention: x_cam = R x_world + t, camera looks
+-- down +z, x right, y down.
+value Pose {
+    rotation: Quaternion
+    translation: Vec3
+}
+
+-- Pinhole intrinsics in pixels; pixel i has its centre at i + 0.5.
+value Intrinsics {
+    width: Integer
+    height: Integer
+    fx: Decimal
+    fy: Decimal
+    cx: Decimal
+    cy: Decimal
+}
+
+value Image {
+    width: Integer
+    height: Integer
+    pixels: List<Decimal>
+}
+
+value TrainOptions {
+    iterations: Integer
+    downscale: Integer
+    eval_holdout: Boolean
+    white_background: Boolean
+    antialias: Boolean
+    absgrad: Boolean
+    max_sh_degree: Integer
+    grad_threshold: Decimal
+    densify: Boolean
+    max_screen_size: Integer?
+    seed: Integer
+    save_at: Set<Integer>
+    log_interval: Integer
+}
+
+value RenderOptions {
+    downscale: Integer
+    white_background: Boolean
+    antialias: Boolean
+    only_view: String?
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract ReconstructionReader {
+    read: (directory: String) -> Reconstruction
+
+    @invariant MatchesColmapLayout
+        -- Binary files follow colmap/src/colmap/scene/reconstruction_io.cc, little-endian,
+        -- and decode files written by COLMAP's scripts/python/read_write_model.py to the
+        -- same values that script reads back.
+
+    @invariant CameraModelTable
+        -- Model ids 0 to 11 and their parameter counts match COLMAP's sensor/models.h,
+        -- including RAD_TAN_THIN_PRISM_FISHEYE as id 11 with 16 parameters.
+
+    @invariant TextFormatEquivalent
+        -- A model written in the text format reads to the same values as the same model
+        -- written in the binary format, whether or not observation lines are empty.
+
+    @invariant CorruptInputIsAnError
+        -- Truncated files, unknown model ids and implausible counts produce a format
+        -- error naming the file; they never panic.
+}
+
+contract SplatCodec {
+    write: (gaussians: Set<Gaussian>, max_sh_degree: Integer) -> ByteArray
+    read: (bytes: ByteArray) -> Set<Gaussian>
+
+    @invariant StandardLayout
+        -- Binary little-endian PLY, float32 properties in the order x y z nx ny nz
+        -- f_dc_0..2 f_rest_* opacity scale_0..2 rot_0..3, f_rest channel-major,
+        -- opacity as a logit, scales as natural logs, rotation as an unnormalised
+        -- (w, x, y, z) quaternion, normals zero. This is the reference save_ply layout.
+
+    @invariant Roundtrip
+        -- read(write(g, d)) reproduces every written parameter to float32 precision.
+
+    @invariant DegreeFromPropertyCount
+        -- read infers the SH degree from the number of f_rest properties (0, 9, 24, 45)
+        -- and rejects any other count.
+}
+
+contract DifferentiableRenderer {
+    render: (gaussians: Set<Gaussian>, intrinsics: Intrinsics, pose: Pose, background: Vec3) -> Image
+    gradients: (gaussians: Set<Gaussian>, intrinsics: Intrinsics, pose: Pose, image_gradient: Image) -> Set<Gaussian>
+
+    @invariant GradientsMatchFiniteDifferences
+        -- In the f64 build, every analytic gradient (SH basis, projection with and without
+        -- antialiasing and with Jacobian clamping, compositing, and the whole chain from
+        -- parameters to loss) agrees with central finite differences to a relative
+        -- tolerance of 1e-5.
+
+    @invariant TiledEqualsPerPixel
+        -- The tile-binned, entry-outer compositor produces the same image as a plain
+        -- per-pixel front-to-back compositor over the same depth-sorted projections.
+
+    @invariant Deterministic
+        -- For identical inputs the render and the gradients are bitwise identical across
+        -- runs and thread counts: sort ties break by entry index and every reduction has a
+        -- fixed order.
+
+    @invariant CompositingThresholds
+        -- Alpha is clamped to 0.99, contributions below 1/255 are skipped, and a pixel
+        -- stops compositing when transmittance would fall below 1e-4; the backward pass
+        -- treats each case exactly as the forward pass did.
+
+    @invariant CullingIsTotal
+        -- A Gaussian at or behind the near plane, with a non-positive 2D determinant, or
+        -- whose tile rectangle is empty contributes nothing and receives a zero gradient.
+}
+
+contract PhotometricLoss {
+    loss: (rendered: Image, photograph: Image, lambda_dssim: Decimal) -> Decimal
+    gradient: (rendered: Image, photograph: Image, lambda_dssim: Decimal) -> Image
+
+    @invariant ReferenceDefinition
+        -- (1 - lambda) * L1 + lambda * (1 - SSIM), SSIM over an 11x11 Gaussian window with
+        -- sigma 1.5, zero padding, C1 = 0.01^2, C2 = 0.03^2, averaged over all values.
+
+    @invariant OptimumHasZeroGradient
+        -- When rendered equals photograph, SSIM is 1 and its gradient vanishes.
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum CameraModel {
+    simple_pinhole | pinhole | simple_radial | radial | opencv | opencv_fisheye
+    | full_opencv | fov | simple_radial_fisheye | radial_fisheye | thin_prism_fisheye
+    | rad_tan_thin_prism_fisheye
+}
+
+enum TrainingStatus { loading | training | finished | failed }
+
+enum RenderStatus { loading | rendering | finished | failed }
+
+enum FailureReason {
+    reconstruction_unreadable | no_registered_images | distorted_camera | image_missing
+    | image_size_mismatch | no_sparse_points | no_training_views | no_matching_view
+    | write_failed
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity TrainingRun {
+    reconstruction: Reconstruction
+    output_directory: String
+    options: TrainOptions
+    status: TrainingStatus
+    iteration: Integer
+    sh_degree: Integer
+    failure: FailureReason when status = failed
+    extent: Decimal when status = training | finished
+
+    transitions status {
+        loading -> training
+        loading -> failed
+        training -> finished
+        training -> failed
+        terminal: finished, failed
+    }
+
+    views: View with run = this
+    gaussians: Gaussian with run = this
+    checkpoints: Checkpoint with run = this
+
+    training_views: views where not held_out
+    held_out_views: views where held_out
+
+    in_densify_window: options.densify and iteration < config.densify_until_iter
+
+    invariant ShDegreeBounded {
+        sh_degree >= 0 and sh_degree <= options.max_sh_degree
+    }
+
+    invariant IterationBounded {
+        iteration >= 0 and iteration <= options.iterations
+    }
+
+    invariant TrainingHasViews {
+        status in {training, finished} implies training_views.count >= 1
+    }
+}
+
+-- A training photograph with the camera reconciled to the file's real size and then
+-- resampled by the integer downscale.
+entity View {
+    run: TrainingRun
+    image_name: String
+    intrinsics: Intrinsics
+    pose: Pose
+    photograph: Image
+    held_out: Boolean
+}
+
+entity Gaussian {
+    run: TrainingRun
+    mean: Vec3
+    log_scale: Vec3
+    rotation: Quaternion
+    opacity_logit: Decimal
+    sh: List<Decimal>
+
+    -- Densification statistics since the previous density-control step.
+    grad_accum: Decimal
+    visible_iterations: Integer
+    max_radius: Integer
+
+    alpha: sigmoid(opacity_logit)
+    largest_scale: max_component(exp_components(log_scale))
+    mean_grad: if visible_iterations > 0: grad_accum / visible_iterations else: 0
+
+    invariant StatisticsNonNegative {
+        grad_accum >= 0 and visible_iterations >= 0 and max_radius >= 0
+    }
+}
+
+-- A PLY file written during or at the end of training.
+entity Checkpoint {
+    run: TrainingRun
+    iteration: Integer
+    path: String
+    gaussian_count: Integer
+}
+
+entity RenderJob {
+    reconstruction: Reconstruction
+    splat_path: String
+    output_directory: String
+    options: RenderOptions
+    status: RenderStatus
+    rendered_count: Integer
+    failure: FailureReason when status = failed
+
+    transitions status {
+        loading -> rendering
+        loading -> failed
+        rendering -> finished
+        rendering -> failed
+        terminal: finished, failed
+    }
+
+    outputs: RenderedView with job = this
+}
+
+entity RenderedView {
+    job: RenderJob
+    image_name: String
+    path: String
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    holdout_every: Integer = 8
+    near_plane: Decimal = 0.2
+    dilation: Decimal = 0.3
+    lambda_dssim: Decimal = 0.2
+    position_lr_init: Decimal = 0.00016
+    position_lr_final: Decimal = 0.0000016
+    position_lr_max_steps: Integer = 30_000
+    feature_lr: Decimal = 0.0025
+    opacity_lr: Decimal = 0.025
+    scaling_lr: Decimal = 0.005
+    rotation_lr: Decimal = 0.001
+    sh_degree_interval: Integer = 1000
+    densify_from_iter: Integer = 500
+    densify_until_iter: Integer = 15_000
+    densification_interval: Integer = 100
+    opacity_reset_interval: Integer = 3000
+    opacity_reset_value: Decimal = 0.01
+    initial_opacity: Decimal = 0.1
+    percent_dense: Decimal = 0.01
+    min_opacity: Decimal = 0.005
+    max_world_size_fraction: Decimal = 0.1
+    split_children: Integer = 2
+    split_shrink: Decimal = 1.6
+    default_grad_threshold: Decimal = 0.0002
+    absgrad_grad_threshold: Decimal = 0.0008
+    reference_checkpoint: Integer = 7000
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Inspection ------------------------------------------------
+
+rule InspectReconstruction {
+    when: InspectReconstruction(shell, reconstruction)
+    ensures: ReconstructionReported(
+        shell: shell,
+        reconstruction: reconstruction,
+        ready: reconstruction.is_trainable
+    )
+
+    @guidance
+        -- info reads only the sparse model; it reports a missing images directory instead
+        -- of failing, and lists every distorted camera with the undistortion command.
+}
+
+-- Training: loading -----------------------------------------
+
+rule StartTraining {
+    when: StartTraining(shell, reconstruction, output_directory, options)
+    requires: options.max_sh_degree >= 0 and options.max_sh_degree <= 3
+    ensures: TrainingRun.created(
+        reconstruction: reconstruction,
+        output_directory: output_directory,
+        options: options,
+        status: loading,
+        iteration: 0,
+        sh_degree: 0
+    )
+
+    @guidance
+        -- When absgrad is set and no threshold was given, the threshold defaults to
+        -- config.absgrad_grad_threshold; otherwise to config.default_grad_threshold. A
+        -- downscale of 0 is treated as 1. With zero iterations the run writes an
+        -- iteration_0 checkpoint of the initial Gaussians and reports their PSNR.
+}
+
+rule RejectUnreadableReconstruction {
+    when: run: TrainingRun.created
+    requires: run.status = loading
+    requires: not readable(run.reconstruction)
+    ensures:
+        run.status = failed
+        run.failure = reconstruction_unreadable
+}
+
+rule RejectEmptyReconstruction {
+    when: run: TrainingRun.created
+    requires: run.status = loading
+    requires: readable(run.reconstruction)
+    requires: run.reconstruction.images.count = 0
+    ensures:
+        run.status = failed
+        run.failure = no_registered_images
+}
+
+rule RejectDistortedCameras {
+    when: run: TrainingRun.created
+    requires: run.status = loading
+    requires: readable(run.reconstruction)
+    requires: run.reconstruction.images.count > 0
+    requires: not run.reconstruction.is_trainable
+    ensures:
+        run.status = failed
+        run.failure = distorted_camera
+}
+
+rule RejectMissingImage {
+    when: run: TrainingRun.created
+    requires: run.status = loading
+    requires: readable(run.reconstruction)
+    requires: run.reconstruction.images.count > 0
+    requires: run.reconstruction.is_trainable
+    requires: run.reconstruction.images.any(i => i.file = null)
+    ensures:
+        run.status = failed
+        run.failure = image_missing
+}
+
+rule RejectMismatchedImageSize {
+    when: run: TrainingRun.created
+    requires: run.status = loading
+    requires: readable(run.reconstruction)
+    requires: run.reconstruction.images.count > 0
+    requires: run.reconstruction.is_trainable
+    requires: run.reconstruction.images.all(i => i.file != null)
+    requires: run.reconstruction.images.any(i => not uniformly_rescaled(i.file, i.camera))
+    ensures:
+        run.status = failed
+        run.failure = image_size_mismatch
+
+    @guidance
+        -- An image whose size differs from the camera's is accepted when both axis scale
+        -- factors agree to within one pixel of rounding (the tandt_db archive stores
+        -- half-size images against full-size cameras); a crop, rotation or different
+        -- aspect ratio is rejected.
+}
+
+rule LoadViews {
+    when: run: TrainingRun.created
+    requires: run.status = loading
+    requires: readable(run.reconstruction)
+    requires: run.reconstruction.images.count > 0
+    requires: run.reconstruction.is_trainable
+    requires: run.reconstruction.images.all(i => i.file != null)
+    requires: run.reconstruction.images.all(i => uniformly_rescaled(i.file, i.camera))
+    ensures:
+        for image in ordered_by_name(run.reconstruction.images):
+            View.created(
+                run: run,
+                image_name: image.name,
+                intrinsics: downscaled(fitted_to_file(image.camera, image.file), run.options.downscale),
+                pose: image.pose,
+                photograph: decoded(image.file, run.options.downscale),
+                held_out: run.options.eval_holdout and is_multiple(position_by_name(image), config.holdout_every)
+            )
+        ViewsLoaded(run: run)
+
+    @guidance
+        -- Resampling uses a Lanczos filter; intrinsics scale by the exact ratio of the new
+        -- and old integer sizes, so rounding of the size introduces no geometric error.
+}
+
+rule RejectWithoutTrainingViews {
+    when: ViewsLoaded(run)
+    requires: run.status = loading
+    requires: run.training_views.count = 0
+    ensures:
+        run.status = failed
+        run.failure = no_training_views
+}
+
+rule RejectWithoutPoints {
+    when: ViewsLoaded(run)
+    requires: run.status = loading
+    requires: run.training_views.count > 0
+    requires: run.reconstruction.points.count = 0
+    ensures:
+        run.status = failed
+        run.failure = no_sparse_points
+}
+
+rule InitialiseGaussians {
+    when: ViewsLoaded(run)
+    requires: run.status = loading
+    requires: run.reconstruction.points.count > 0
+    requires: run.training_views.count > 0
+    ensures:
+        run.status = training
+        run.extent = scene_extent(run.training_views)
+        for point in run.reconstruction.points:
+            Gaussian.created(
+                run: run,
+                mean: point.position,
+                log_scale: isotropic_log_scale(mean_squared_distance_to_three_nearest(point)),
+                rotation: identity_rotation(),
+                opacity_logit: logit(config.initial_opacity),
+                sh: dc_only(point.colour, run.options.max_sh_degree),
+                grad_accum: 0,
+                visible_iterations: 0,
+                max_radius: 0
+            )
+        IterationDue(run: run)
+
+    @guidance
+        -- The extent is 1.1 times the largest distance of a training camera centre from
+        -- the mean training camera centre; held-out cameras do not contribute. Coincident
+        -- sparse points count as zero-distance neighbours of each other.
+}
+
+-- Training: the loop ----------------------------------------
+
+rule TakeTrainingStep {
+    when: IterationDue(run)
+    requires: run.status = training
+    requires: run.iteration < run.options.iterations
+    let view = next_view(run.training_views, run.options.seed, run.iteration)
+    ensures:
+        run.iteration = run.iteration + 1
+        if is_multiple(run.iteration, config.sh_degree_interval) and run.sh_degree < run.options.max_sh_degree:
+            run.sh_degree = run.sh_degree + 1
+        StepTaken(run: run, view: view)
+
+    @guidance
+        -- One step: render the view through DifferentiableRenderer, compute
+        -- PhotometricLoss against its photograph, back-propagate, accumulate densification
+        -- statistics while in the densification window, then take one Adam step with the
+        -- per-group learning rates in config (positions scaled by the extent and decayed
+        -- exponentially). Views are shuffled per epoch with a seeded generator.
+}
+
+rule AfterStep {
+    when: StepTaken(run, view)
+    ensures:
+        if run.in_densify_window and run.iteration > config.densify_from_iter and is_multiple(run.iteration, config.densification_interval):
+            DensificationDue(run: run)
+        if run.in_densify_window and is_multiple(run.iteration, config.opacity_reset_interval):
+            OpacityResetDue(run: run)
+        if run.in_densify_window and run.options.white_background and run.iteration = config.densify_from_iter:
+            OpacityResetDue(run: run)
+        if run.options.log_interval > 0 and (is_multiple(run.iteration, run.options.log_interval) or run.iteration = run.options.iterations):
+            ProgressReported(run: run, progress: progress_of(run, view))
+        if run.iteration < run.options.iterations and (run.iteration in run.options.save_at or run.iteration = config.reference_checkpoint):
+            CheckpointDue(run: run)
+        IterationDue(run: run)
+}
+
+rule FinishTraining {
+    when: IterationDue(run)
+    requires: run.status = training
+    requires: run.iteration >= run.options.iterations
+    ensures: FinalCheckpointDue(run: run)
+}
+
+-- Density control -------------------------------------------
+
+rule DensifyAndPrune {
+    when: DensificationDue(run)
+    let threshold = run.options.grad_threshold
+    let size_limit = config.percent_dense * run.extent
+    let candidates = filter(run.gaussians, g => g.mean_grad >= threshold)
+    ensures:
+        for g in candidates where largest_scale <= size_limit:
+            Gaussian.created(
+                run: run,
+                mean: g.mean,
+                log_scale: g.log_scale,
+                rotation: g.rotation,
+                opacity_logit: g.opacity_logit,
+                sh: g.sh,
+                grad_accum: 0,
+                visible_iterations: 0,
+                max_radius: 0
+            )
+        for g in candidates where largest_scale > size_limit:
+            for k in child_indices(config.split_children):
+                Gaussian.created(
+                    run: run,
+                    mean: sample_within(g, run.options.seed, k),
+                    log_scale: shrunk(g.log_scale, config.split_shrink),
+                    rotation: g.rotation,
+                    opacity_logit: g.opacity_logit,
+                    sh: g.sh,
+                    grad_accum: 0,
+                    visible_iterations: 0,
+                    max_radius: 0
+                )
+            not exists g
+        PruneDue(run: run)
+
+    @guidance
+        -- Positional gradients are converted to NDC units by scaling with half the image
+        -- size before accumulation, so the reference threshold applies unchanged. Only
+        -- Gaussians that existed before this step are candidates; new Gaussians start with
+        -- zero optimiser moments.
+}
+
+rule Prune {
+    when: PruneDue(run)
+    let past_first_reset = run.iteration > config.opacity_reset_interval
+    ensures:
+        for g in run.gaussians:
+            if g.alpha < config.min_opacity:
+                not exists g
+            else if past_first_reset and g.largest_scale > config.max_world_size_fraction * run.extent:
+                not exists g
+            else if run.options.max_screen_size != null and g.max_radius > run.options.max_screen_size:
+                not exists g
+            else:
+                g.grad_accum = 0
+                g.visible_iterations = 0
+                g.max_radius = 0
+
+    @guidance
+        -- Screen-size pruning is off unless max_screen_size is given: the reference resets
+        -- its radius statistics before testing them, so its version never fires.
+}
+
+rule ResetOpacity {
+    when: OpacityResetDue(run)
+    ensures:
+        for g in run.gaussians where alpha > config.opacity_reset_value:
+            g.opacity_logit = logit(config.opacity_reset_value)
+        OptimiserOpacityMomentsCleared(run: run)
+}
+
+-- Checkpoints -----------------------------------------------
+
+rule WriteCheckpoint {
+    when: CheckpointDue(run)
+    requires: run.status = training
+    requires: writable(checkpoint_path(run.output_directory, run.iteration))
+    ensures: Checkpoint.created(
+        run: run,
+        iteration: run.iteration,
+        path: checkpoint_path(run.output_directory, run.iteration),
+        gaussian_count: run.gaussians.count
+    )
+
+    @guidance
+        -- The path is <out>/point_cloud/iteration_<N>/point_cloud.ply, the reference layout;
+        -- the file is written through SplatCodec with the run's max SH degree.
+}
+
+rule FailOnUnwritableCheckpoint {
+    when: CheckpointDue(run)
+    requires: run.status = training
+    requires: not writable(checkpoint_path(run.output_directory, run.iteration))
+    ensures:
+        run.status = failed
+        run.failure = write_failed
+}
+
+rule WriteFinalCheckpoint {
+    when: FinalCheckpointDue(run)
+    requires: run.status = training
+    requires: writable(checkpoint_path(run.output_directory, run.iteration))
+    ensures:
+        run.status = finished
+        Checkpoint.created(
+            run: run,
+            iteration: run.iteration,
+            path: checkpoint_path(run.output_directory, run.iteration),
+            gaussian_count: run.gaussians.count
+        )
+        EvaluationReported(
+            run: run,
+            train_psnr: mean_psnr(run.gaussians, run.training_views),
+            test_psnr: mean_psnr(run.gaussians, run.held_out_views)
+        )
+
+    @guidance
+        -- The test PSNR is reported only when the run held views out. PSNR clamps both
+        -- images to [0, 1] and accumulates in f64.
+}
+
+rule FailOnUnwritableFinalCheckpoint {
+    when: FinalCheckpointDue(run)
+    requires: run.status = training
+    requires: not writable(checkpoint_path(run.output_directory, run.iteration))
+    ensures:
+        run.status = failed
+        run.failure = write_failed
+}
+
+-- Rendering -------------------------------------------------
+
+rule StartRender {
+    when: RenderViews(shell, reconstruction, splat_path, output_directory, options)
+    ensures: RenderJob.created(
+        reconstruction: reconstruction,
+        splat_path: splat_path,
+        output_directory: output_directory,
+        options: options,
+        status: loading,
+        rendered_count: 0
+    )
+}
+
+rule RejectUnreadableRenderInput {
+    when: job: RenderJob.created
+    requires: job.status = loading
+    requires: not readable(job.reconstruction) or not decodable_splat(job.splat_path)
+    ensures:
+        job.status = failed
+        job.failure = reconstruction_unreadable
+}
+
+rule RejectDistortedRenderCameras {
+    when: job: RenderJob.created
+    requires: job.status = loading
+    requires: readable(job.reconstruction)
+    requires: decodable_splat(job.splat_path)
+    requires: not job.reconstruction.is_trainable
+    ensures:
+        job.status = failed
+        job.failure = distorted_camera
+}
+
+rule RenderEachView {
+    when: job: RenderJob.created
+    requires: job.status = loading
+    requires: readable(job.reconstruction)
+    requires: decodable_splat(job.splat_path)
+    requires: job.reconstruction.is_trainable
+    let selected = job.reconstruction.images where job.options.only_view = null or name = job.options.only_view
+    ensures:
+        job.status = rendering
+        for image in selected:
+            RenderedView.created(
+                job: job,
+                image_name: image.name,
+                path: png_path(job.output_directory, image.name)
+            )
+        RenderingDone(job: job)
+
+    @guidance
+        -- Views render in file order at the camera's recorded size divided by the downscale
+        -- (0 is treated as 1); the images directory is not read. The PNG
+        -- keeps any subdirectory of the image name so multi-camera rigs do not collide.
+}
+
+rule FinishRender {
+    when: RenderingDone(job)
+    requires: job.status = rendering
+    requires: job.outputs.count > 0
+    ensures:
+        job.status = finished
+        job.rendered_count = job.outputs.count
+}
+
+rule FailEmptyRender {
+    when: RenderingDone(job)
+    requires: job.status = rendering
+    requires: job.outputs.count = 0
+    ensures:
+        job.status = failed
+        job.failure = no_matching_view
+
+    @guidance
+        -- Reached when --view names no registered image.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant GaussiansOnlyInLiveRuns {
+    for g in Gaussians:
+        g.run.status in {training, finished}
+}
+
+invariant CheckpointsWithinRun {
+    for c in Checkpoints:
+        c.iteration >= 0 and c.iteration <= c.run.options.iterations
+}
+
+invariant FinishedRunHasFinalCheckpoint {
+    for run in TrainingRuns:
+        run.status = finished implies run.checkpoints.any(c => c.iteration = run.options.iterations)
+}
+
+invariant ViewsUseSingleDownscale {
+    for v in Views:
+        v.intrinsics.width >= 1 and v.intrinsics.height >= 1
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface CommandLine {
+    facing shell: Shell
+
+    exposes:
+        for run in TrainingRuns:
+            run.reconstruction.directory
+            run.status
+            run.iteration
+            run.sh_degree
+            run.gaussians.count
+            run.checkpoints
+
+    provides:
+        InspectReconstruction(shell, reconstruction)
+        StartTraining(shell, reconstruction, output_directory, options)
+        RenderViews(shell, reconstruction, splat_path, output_directory, options)
+
+    contracts:
+        demands ReconstructionReader
+
+    @guarantee FailuresAreReported
+        -- Every failure ends the command with a non-zero exit status and a message naming
+        -- the file and the reason; the tool never panics on user input.
+
+    @guarantee ReferenceOutputLayout
+        -- Checkpoints appear at point_cloud/iteration_<N>/point_cloud.ply under the output
+        -- directory, at the reference checkpoint, at every requested iteration and at the
+        -- final iteration.
+
+    @guidance
+        -- Subcommands are info, train and render; --threads sets the worker count globally.
+}
+
+surface SplatExport {
+    facing viewer: SplatViewer
+
+    exposes:
+        for c in Checkpoints:
+            c.path
+            c.gaussian_count
+
+    contracts:
+        fulfils SplatCodec
+
+    @guarantee ColmapWorldFrame
+        -- Splats are stored in COLMAP's world frame with its arbitrary scale and no fixed up
+        -- direction; viewers must rotate and scale on import.
+}
+
+surface TrainingKernels {
+    facing shell: Shell
+
+    contracts:
+        fulfils DifferentiableRenderer
+        fulfils PhotometricLoss
+
+    @guarantee PrecisionSelectable
+        -- The same code builds with f32 scalars by default and f64 scalars under the f64
+        -- feature; the f64 build exists so the gradient checks can use tight tolerances.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "Exposure compensation: should per-image affine colour correction be learned, as in the 2024 reference update, to absorb exposure drift in captures?"
+open question "Densification: should 3DGS-MCMC relocation under a Gaussian budget replace clone-and-split, or be offered beside it?"
+open question "Input formats: should Nerfstudio transforms.json be accepted, so NeRF-Synthetic scenes can be used without COLMAP?"
+open question "Masks: should per-image masks exclude moving objects and the capturer's shadow from the loss?"
+open question "Resumption: should checkpoints carry optimiser state so training can resume, or stay plain PLY files?"
+open question "GPU backend: does a wgpu backend reuse this spec unchanged, with DifferentiableRenderer as the only replaced contract?"
