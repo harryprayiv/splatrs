@@ -43,8 +43,11 @@ pub enum Error {
         /// COLMAP model name.
         model: String,
     },
-    /// An image on disk does not match the size recorded by COLMAP.
-    #[error("image {path} is {actual_w}x{actual_h} but COLMAP recorded {expected_w}x{expected_h}")]
+    /// An image on disk is neither the size recorded by COLMAP nor a uniform rescaling of it.
+    #[error(
+        "image {path} is {actual_w}x{actual_h} but COLMAP recorded {expected_w}x{expected_h}, \
+         and the two sizes do not have the same aspect ratio"
+    )]
     ImageSizeMismatch {
         /// The image path.
         path: PathBuf,

@@ -150,15 +150,24 @@ pub fn load(sparse: &Path, images: &Path, downscale: u32) -> Result<Dataset> {
                     source: e,
                 })?
                 .to_rgb8();
-            if decoded.width() != camera.width || decoded.height() != camera.height {
-                return Err(Error::ImageSizeMismatch {
-                    path,
-                    expected_w: camera.width,
-                    expected_h: camera.height,
-                    actual_w: decoded.width(),
-                    actual_h: decoded.height(),
-                });
-            }
+            let camera = match_image_size(&camera, decoded.width(), decoded.height()).map_err(
+                |e| match e {
+                    Error::ImageSizeMismatch {
+                        expected_w,
+                        expected_h,
+                        actual_w,
+                        actual_h,
+                        ..
+                    } => Error::ImageSizeMismatch {
+                        path: path.clone(),
+                        expected_w,
+                        expected_h,
+                        actual_w,
+                        actual_h,
+                    },
+                    other => other,
+                },
+            )?;
             let (w, h) = (
                 ((camera.width as f64 / downscale as f64).round() as u32).max(1),
                 ((camera.height as f64 / downscale as f64).round() as u32).max(1),
@@ -193,6 +202,36 @@ pub fn load(sparse: &Path, images: &Path, downscale: u32) -> Result<Dataset> {
     })
 }
 
+/// Reconcile a camera with the size of the image file it belongs to. Datasets often ship
+/// images resampled after COLMAP ran (the 3DGS `tandt_db` archive stores half-size images
+/// against full-size cameras), so a uniformly scaled image is accepted and the intrinsics
+/// are scaled to it. The two axis scale factors must agree to within one pixel of rounding;
+/// anything else (a crop, a rotation, a different aspect ratio) is rejected, because the
+/// intrinsics could not be trusted.
+pub fn match_image_size(camera: &Camera, width: u32, height: u32) -> Result<Camera> {
+    if width == camera.width && height == camera.height {
+        return Ok(camera.clone());
+    }
+    let (cw, ch) = (camera.width as f64, camera.height as f64);
+    let (w, h) = (width as f64, height as f64);
+    let width_from_height = cw * h / ch;
+    let height_from_width = ch * w / cw;
+    if width == 0
+        || height == 0
+        || (width_from_height - w).abs() > 1.0
+        || (height_from_width - h).abs() > 1.0
+    {
+        return Err(Error::ImageSizeMismatch {
+            path: PathBuf::from(&camera.name),
+            expected_w: camera.width,
+            expected_h: camera.height,
+            actual_w: width,
+            actual_h: height,
+        });
+    }
+    Ok(camera.resized(width, height))
+}
+
 /// Split views into training and held-out sets the way the reference `--eval` flag does:
 /// every `hold`-th view (by index) is held out.
 pub fn split_eval(views: Vec<View>, hold: usize) -> (Vec<View>, Vec<View>) {
@@ -206,4 +245,51 @@ pub fn split_eval(views: Vec<View>, hold: usize) -> (Vec<View>, Vec<View>) {
         }
     }
     (train, test)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::math::M3;
+
+    fn truck_camera() -> Camera {
+        Camera {
+            name: "000001.jpg".to_string(),
+            width: 1957,
+            height: 1091,
+            fx: 1163.2547,
+            fy: 1156.2804,
+            cx: 978.5,
+            cy: 545.5,
+            rot: M3::IDENTITY,
+            trans: V3::ZERO,
+        }
+    }
+
+    #[test]
+    fn same_size_is_unchanged() {
+        let c = truck_camera();
+        assert_eq!(match_image_size(&c, 1957, 1091).unwrap(), c);
+    }
+
+    #[test]
+    fn half_size_images_rescale_intrinsics() {
+        // The tandt_db archive: cameras at 1957x1091, images at 979x546.
+        let c = match_image_size(&truck_camera(), 979, 546).unwrap();
+        assert_eq!((c.width, c.height), (979, 546));
+        let sx = 979.0 / 1957.0;
+        let sy = 546.0 / 1091.0;
+        assert!((c.fx as f64 - 1163.2547 * sx).abs() < 1e-3);
+        assert!((c.fy as f64 - 1156.2804 * sy).abs() < 1e-3);
+        assert!((c.cx as f64 - 978.5 * sx).abs() < 1e-3);
+        assert!((c.cy as f64 - 545.5 * sy).abs() < 1e-3);
+    }
+
+    #[test]
+    fn different_aspect_ratio_is_rejected() {
+        // A crop or a rotated image must not be silently rescaled.
+        assert!(match_image_size(&truck_camera(), 979, 600).is_err());
+        assert!(match_image_size(&truck_camera(), 1091, 1957).is_err());
+        assert!(match_image_size(&truck_camera(), 0, 0).is_err());
+    }
 }
