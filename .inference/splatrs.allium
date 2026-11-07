@@ -398,6 +398,8 @@ rule InspectReconstruction {
 
 rule StartTraining {
     when: StartTraining(shell, reconstruction, output_directory, options)
+    requires: options.iterations >= 1
+    requires: options.downscale >= 1
     requires: options.max_sh_degree >= 0 and options.max_sh_degree <= 3
     ensures: TrainingRun.created(
         reconstruction: reconstruction,
@@ -410,9 +412,9 @@ rule StartTraining {
 
     @guidance
         -- When absgrad is set and no threshold was given, the threshold defaults to
-        -- config.absgrad_grad_threshold; otherwise to config.default_grad_threshold. A
-        -- downscale of 0 is treated as 1. With zero iterations the run writes an
-        -- iteration_0 checkpoint of the initial Gaussians and reports their PSNR.
+        -- config.absgrad_grad_threshold; otherwise to config.default_grad_threshold.
+        -- Zero iterations or a zero downscale are rejected by the command line before a
+        -- run exists, and again by the library entry points.
 }
 
 rule RejectUnreadableReconstruction {
@@ -727,6 +729,7 @@ rule FailOnUnwritableFinalCheckpoint {
 
 rule StartRender {
     when: RenderViews(shell, reconstruction, splat_path, output_directory, options)
+    requires: options.downscale >= 1
     ensures: RenderJob.created(
         reconstruction: reconstruction,
         splat_path: splat_path,
@@ -775,8 +778,8 @@ rule RenderEachView {
         RenderingDone(job: job)
 
     @guidance
-        -- Views render in file order at the camera's recorded size divided by the downscale
-        -- (0 is treated as 1); the images directory is not read. The PNG
+        -- Views render in file order at the camera's recorded size divided by the downscale;
+        -- the images directory is not read. The PNG
         -- keeps any subdirectory of the image name so multi-camera rigs do not collide.
 }
 

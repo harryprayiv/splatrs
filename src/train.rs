@@ -169,6 +169,11 @@ pub fn train(
     if views.is_empty() {
         return Err(crate::Error::Invalid("no training views".to_string()));
     }
+    if cfg.iterations == 0 {
+        return Err(crate::Error::Invalid(
+            "iterations must be at least 1".to_string(),
+        ));
+    }
     if cfg.sh_degree > crate::sh::MAX_DEGREE {
         return Err(crate::Error::Invalid(format!(
             "sh_degree {} exceeds the maximum of {}",
@@ -313,4 +318,59 @@ pub fn evaluate(model: &Model, views: &[View], cfg: &TrainConfig) -> Real {
         total += psnr(&img, &v.to_real());
     }
     total / views.len() as Real
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::camera::Camera;
+    use crate::math::V3;
+
+    fn one_view() -> View {
+        View {
+            camera: Camera::look_at(
+                "v.png",
+                16,
+                16,
+                16.0,
+                16.0,
+                V3::new(0.0, 0.0, -3.0),
+                V3::ZERO,
+                V3::new(0.0, -1.0, 0.0),
+            ),
+            rgb: vec![0; 16 * 16 * 3],
+        }
+    }
+
+    fn empty_model() -> Model {
+        Model {
+            gaussians: Vec::new(),
+            sh_degree: 0,
+            max_sh_degree: 0,
+        }
+    }
+
+    #[test]
+    fn zero_iterations_is_rejected_without_saving() {
+        let cfg = TrainConfig {
+            iterations: 0,
+            sh_degree: 0,
+            log_interval: 0,
+            ..TrainConfig::default()
+        };
+        let mut saved = false;
+        let result = train(
+            empty_model(),
+            &[one_view()],
+            1.0,
+            &cfg,
+            |_| {},
+            |_, _| {
+                saved = true;
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Err(crate::Error::Invalid(_))));
+        assert!(!saved, "a rejected run must not write a checkpoint");
+    }
 }

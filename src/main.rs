@@ -51,11 +51,11 @@ enum Command {
         /// Output directory.
         #[arg(long)]
         out: PathBuf,
-        /// Number of iterations.
-        #[arg(long, default_value_t = 30_000)]
+        /// Number of iterations (at least 1).
+        #[arg(long, default_value_t = 30_000, value_parser = clap::value_parser!(u32).range(1..))]
         iterations: u32,
-        /// Integer factor by which to downscale the training images.
-        #[arg(long, default_value_t = 1)]
+        /// Integer factor by which to downscale the training images (at least 1).
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
         downscale: u32,
         /// Hold out every 8th image for a final PSNR report.
         #[arg(long)]
@@ -102,8 +102,8 @@ enum Command {
         /// Output directory for PNG files.
         #[arg(long)]
         out: PathBuf,
-        /// Integer factor by which to downscale the render resolution.
-        #[arg(long, default_value_t = 1)]
+        /// Integer factor by which to downscale the render resolution (at least 1).
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
         downscale: u32,
         /// Render on a white background.
         #[arg(long)]
@@ -326,7 +326,6 @@ fn run_render(
     };
     let opts = cfg.proj_opts(model.sh_degree);
     let bg = cfg.background();
-    let downscale = downscale.max(1);
     let mut rendered = 0;
     for img in &colmap_model.images {
         if let Some(name) = only {

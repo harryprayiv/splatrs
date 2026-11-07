@@ -125,11 +125,13 @@ pub fn camera_from_colmap(model: &ColmapModel, img: &colmap::ColmapImage) -> Res
     })
 }
 
-/// Load the model and every registered image, downscaling by the integer `downscale`.
-/// Views are ordered by image name, as the reference loader orders them, so that the
-/// `--eval` hold-out picks the same images.
+/// Load the model and every registered image, downscaling by the integer `downscale`,
+/// which must be at least 1. Views are ordered by image name, as the reference loader
+/// orders them, so that the `--eval` hold-out picks the same images.
 pub fn load(sparse: &Path, images: &Path, downscale: u32) -> Result<Dataset> {
-    let downscale = downscale.max(1);
+    if downscale == 0 {
+        return Err(Error::Invalid("downscale must be at least 1".to_string()));
+    }
     let mut model = colmap::read_model(sparse)?;
     if model.images.is_empty() {
         return Err(Error::Invalid(format!(
@@ -283,6 +285,15 @@ mod tests {
         assert!((c.fy as f64 - 1156.2804 * sy).abs() < 1e-3);
         assert!((c.cx as f64 - 978.5 * sx).abs() < 1e-3);
         assert!((c.cy as f64 - 545.5 * sy).abs() < 1e-3);
+    }
+
+    #[test]
+    fn zero_downscale_is_rejected_before_reading() {
+        let missing = Path::new("/nonexistent/splatrs/sparse");
+        match load(missing, missing, 0) {
+            Err(Error::Invalid(m)) => assert!(m.contains("downscale")),
+            other => panic!("expected an invalid-downscale error, got {other:?}"),
+        }
     }
 
     #[test]
