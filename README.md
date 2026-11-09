@@ -62,11 +62,11 @@ Video is acceptable when stills are impractical, with these rules: shoot the hig
 
 ## 6. From images to camera poses with COLMAP
 
-Put the images in `proj/images`. From the project's Nix dev shell (`nix develop`), which provides `colmap`, run the following. The GPU flags keep COLMAP on the CPU, which avoids OpenGL problems on headless and integrated-graphics machines; on a machine with a working discrete GPU they can be dropped.
+Put the images in `proj/images`. From the project's Nix dev shell (`nix develop`), which provides `colmap`, run the following. The GPU flags keep COLMAP on the CPU, which avoids OpenGL problems on headless and integrated-graphics machines; on a machine with a working discrete GPU they can be dropped. The flag names are those of COLMAP 3.13 and later (`colmap -h` prints the version); COLMAP 3.12 and earlier call them `--SiftExtraction.use_gpu` and `--SiftMatching.use_gpu`.
 
 ```sh
-colmap feature_extractor --database_path proj/database.db --image_path proj/images --ImageReader.camera_model SIMPLE_RADIAL --ImageReader.single_camera 1 --SiftExtraction.use_gpu 0
-colmap exhaustive_matcher --database_path proj/database.db --SiftMatching.use_gpu 0
+colmap feature_extractor --database_path proj/database.db --image_path proj/images --ImageReader.camera_model SIMPLE_RADIAL --ImageReader.single_camera 1 --FeatureExtraction.use_gpu 0
+colmap exhaustive_matcher --database_path proj/database.db --FeatureMatching.use_gpu 0
 colmap mapper --database_path proj/database.db --image_path proj/images --output_path proj/sparse
 colmap image_undistorter --image_path proj/images --input_path proj/sparse/0 --output_path proj/undistorted --output_type COLMAP
 ```
